@@ -1,0 +1,1518 @@
+---
+title: "MONSTAR2 Whole exome sequencing data analysis - Victoria Lee STA project"
+author: "Victoria Serelli Lee"
+date: "2024-10-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(data.table)
+library(ggplot2)
+library(janitor)
+library(plotrix)
+library(maftools)
+library(stringr)
+library(fgsea)
+library(forcats)
+```
+
+## Introduction
+
+This is a documentation of analyses performed using the whole exome sequencing data from the MONSTAR2 for my STA project, data presented at the DISCO meeting on 8th Oct 2024. 
+For more information on the cohort characteristics and raw data location please visit the Confluence page for this data set. https://lilly-confluence.atlassian.net/wiki/x/VwHtYg
+
+Processing of sample level .tsv files, cleaning (remove replicates for samples that had multiple result files for reasons unknown), combining, maf2maf and oncoKB annotation, final combination into the genomic_table was done in prior scripts.
+
+Extracting of key clinical data from eDC format data files, combining and creation of flags were also done in a prior script.
+
+RNAseq data was also available for this patient cohort. Upon QC of data, inconsistencies were observed and re-processed data from the vendor is still pending receipt as of Nov2024.
+Another R markdown document will be prepared for this data set once analyses are complete.
+
+## 1. Data preparation
+Read in genomic data table, subject ID to tumor_sample_barcode matching key and clinical data
+
+```{r reading in data, include=TRUE}
+## Get DNA data from genomic table ########
+genomic_table <- read.csv("/fsx/home/vlee/Projects/MONSTAR2/Analysis_dataset/MONSTAR2_Genomic_Table_all.csv")
+all_samples <- unique(genomic_table$Tumor_Sample_Barcode)
+## Get key of subjid to tumor_sample_barcode  ########
+ptlisting <- read.table("/fsx/home/vlee/Projects/MONSTAR2/MONSTAR_genome_data_20240617/info.txt")
+subjid2sample <- ptlisting%>%
+  mutate(Tumor_Sample_Barcode = substr(V2, 1, 11))%>%
+  select(V1, Tumor_Sample_Barcode)%>%
+  filter(Tumor_Sample_Barcode %in% all_samples)%>%
+  unique()
+colnames(subjid2sample) <- c("SUBJID", "Tumor_Sample_Barcode")
+
+#### Get clinical data ###############
+clinical <- read.csv("/fsx/home/vlee/Projects/MONSTAR2/Analysis_dataset/MONSTAR2_Clinical_2024-08-08.csv")
+
+```
+
+```{r create_subjid_tsb_lists, include=TRUE}
+## Clinical data for all CRC patients were annotated with "EO" or "LO" based our defined cut off age in section 4 below, for downstream analyses
+crc_all <- clinical%>%
+  filter(CANCERTYPE =="Colorectal cancer")%>%
+  mutate(AgeGroup = if_else(FirstDXAge<40, "<40", 
+                            if_else(FirstDXAge>=40&FirstDXAge<46, "40-45",
+                                    if_else(FirstDXAge>=46&FirstDXAge<50, "46-50", ">=50"))))%>%
+  mutate(Onset = if_else(FirstDXAge<50, "EO", "LO"))
+crc_all <- merge(crc_all, subjid2sample, by = "SUBJID", all.x = TRUE)
+
+
+```
+
+## 2. Summary of Alterations
+For the presentation, colorectal cancer was selected and MONSTAR2 data was compared to TCGA data to understand overall differences 
+
+Firstly, data from the genomic table is transformed into a matrix to enable generation of an oncoprint using ComplexHeatmap
+
+```{r genome matrix, include=TRUE}
+keep <- c("Likely Oncogenic", "Oncogenic", "Resistance")
+
+genomic_matrix <- genomic_table%>%
+ filter(ONCOGENIC %in% keep)%>%
+  filter(SOMATIC_STATUS =="somatic")%>%
+  mutate(Missense = if_else(Variant_Classification =="Missense_Mutation", 1, 0))%>%
+  mutate(Stop = if_else(Variant_Classification =="Nonsense_Mutation", 1, 0))%>%
+  mutate(Splice =if_else(Variant_Classification =="Splice_Site",1, 0))%>%
+  mutate(Frameshift = if_else(grepl("Frame_Shift", Variant_Classification), 1,0))%>%
+  mutate(Inframe = if_else(grepl("In_Frame", Variant_Classification), 1, 0))%>%
+  mutate(Amplification = if_else(VAF =="Amplification", 1, 0))%>%
+  mutate(Deletion = if_else(VAF =="Deletion", 1,0))%>%
+  mutate(Structural_var = if_else(Variant_Type =="Fusion", 1, 0))%>%
+  select(Tumor_Sample_Barcode, CANCERTYPE, PrimaryCancerHist, ONCOGENIC, SOMATIC_STATUS, Hugo_Symbol, Missense, Stop, Splice, Frameshift, Inframe, Amplification, Deletion, Structural_var)
+
+```
+
+For each kind of alteration a matrix was created:
+```{r oncoprint1, include=FALSE}
+cancer <- "Colorectal cancer"                                                                  
+genelist <- genomic_matrix%>%
+  filter(CANCERTYPE ==cancer)%>%
+  select(Hugo_Symbol)%>%
+  unique()%>%
+  unlist()
+samples <-  genomic_matrix%>%
+  filter(CANCERTYPE ==cancer)%>%
+  select(Tumor_Sample_Barcode)%>%
+  unique()%>%
+  unlist()
+
+```
+
+```{r oncoprint2, include=TRUE}
+missense_matrix <- matrix(0,
+                     nrow = length(genelist),
+                     ncol = length(samples))
+colnames(missense_matrix) = samples
+rownames(missense_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  missense_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Missense)
+  
+}
+
+```
+this was repeated for nonsense, splice, frameshift, inframe variants, copy number variants and structural variants
+
+```{r oncoprint3, include=FALSE}
+### Nonsense matrix
+nonsense_matrix <- matrix(0,
+                         nrow = length(genelist),
+                         ncol = length(samples))
+colnames(nonsense_matrix) = samples
+rownames(nonsense_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  nonsense_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Stop)
+}
+## Splice variants matrix
+splice_matrix <- matrix(0,
+                          nrow = length(genelist),
+                          ncol = length(samples))
+colnames(splice_matrix) = samples
+rownames(splice_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  splice_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Splice)
+}
+## Frameshift variants matrix
+fs_matrix <- matrix(0,
+                        nrow = length(genelist),
+                        ncol = length(samples))
+colnames(fs_matrix) = samples
+rownames(fs_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  fs_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Frameshift)
+}
+
+## Inframe variants matrix
+inframe_matrix <- matrix(0,
+                    nrow = length(genelist),
+                    ncol = length(samples))
+colnames(inframe_matrix) = samples
+rownames(inframe_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  inframe_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Inframe)
+}
+
+
+## Amplifications variants matrix
+amp_matrix <- matrix(0,
+                         nrow = length(genelist),
+                         ncol = length(samples))
+colnames(amp_matrix) = samples
+rownames(amp_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  amp_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Amplification)
+}
+
+## Deletions variants matrix
+del_matrix <- matrix(0,
+                     nrow = length(genelist),
+                     ncol = length(samples))
+colnames(del_matrix) = samples
+rownames(del_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  del_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Deletion)
+}
+## Fusion variants matrix
+fusion_matrix <- matrix(0,
+                     nrow = length(genelist),
+                     ncol = length(samples))
+colnames(fusion_matrix) = samples
+rownames(fusion_matrix) = genelist
+
+for (s in samples){
+  tmp = genomic_matrix[genomic_matrix$Tumor_Sample_Barcode ==s,]
+  fusion_matrix[match(tmp$Hugo_Symbol, genelist), s] = as.numeric(tmp$Structural_var)
+}
+
+col = c(Amplifications = "firebrick2",
+        Deletions = "blue",
+        Missense = "darkgreen",
+        Truncating = "black",
+        Splice = "orange",
+        FrameShift_indel = "sienna",
+        InFrame_indel = "brown",
+        Structural_Variants = "purple")
+```
+
+the top 30 most frequently altered genes in MONSTAR2 were selected for including in oncoprint
+```{r}
+top <- data.frame(missense = rowSums(missense_matrix),
+                  nonsense = rowSums(nonsense_matrix),
+                  splice = rowSums(splice_matrix),
+                  inframe = rowSums(inframe_matrix),
+                  fs = rowSums(fs_matrix),
+                  amp = rowSums(amp_matrix),
+                  del = rowSums(del_matrix),
+                  fus = rowSums(fusion_matrix))
+rownames(top) <- rownames(missense_matrix)
+top$total <- rowSums(top)
+top30 <- top%>%
+  arrange(desc(total))%>%
+  slice(1:30)
+top30 <- rownames(top30)
+```
+
+Matrices for alterations were filtered down the the top 30 genes, then oncoprint was generated using filtered down data
+
+```{r oncoprint4, include=FALSE}
+missense_matrix1 <- missense_matrix[top30,]
+nonsense_matrix1 <- nonsense_matrix[top30,]
+splice_matrix1 <- splice_matrix[top30,]
+fs_matrix1 <- fs_matrix[top30,]
+inframe_matrix1 <- inframe_matrix[top30,]
+amp_matrix1 <- amp_matrix[top30,]
+del_matrix1 <- del_matrix[top30,]
+fusion_matrix1 <- fusion_matrix[top30,]
+
+
+mat_listtop20 <- list(Missense= missense_matrix1,
+                     Truncating = nonsense_matrix1, 
+                     Splice = splice_matrix1,
+                     FrameShift_indel = fs_matrix1,
+                     InFrame_indel = inframe_matrix1, 
+                     Amplifications = amp_matrix1,
+                     Deletions = del_matrix1,
+                     Structural_Variants = fusion_matrix1)
+
+
+```
+**MONSTAR2 Colorectal cancer Oncoprint**
+```{r oncoprint_final, echo=FALSE, out.width= "100%", cache.comments=FALSE}
+oncoPrint(mat_listtop20,
+          alter_fun = list(
+            background =  function(x, y, w, h) grid.rect(x, y, w, h, 
+                                                         gp = gpar(fill = "#00FF0020", col = "white")),
+            Missense = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.3, 
+                                                 gp = gpar(fill = col["Missense"], col = NA)),
+            Truncating = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.3, 
+                                                   gp = gpar(fill = col["Truncating"], col = NA)),
+            Splice = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.3, 
+                                                    gp = gpar(fill = col["Splice"], col = NA)),
+            FrameShift_indel = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.3, 
+                                                    gp = gpar(fill = col["FrameShift_indel"], col = NA)),
+            InFrame_indel = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.3, 
+                                                        gp = gpar(fill = col["InFrame_indel"], col = NA)),
+            Amplifications = function(x, y, w, h) grid.rect(x, y, w*0.9, h*1, 
+                                                     gp = gpar(fill = col["Amplifications"], col = NA)),
+            Deletions = function(x, y, w, h) grid.rect(x, y, w*0.9, h*1, 
+                                                     gp = gpar(fill = col["Deletions"], col = NA)),
+            Structural_Variants = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.5, 
+                                                       gp = gpar(fill = col["Structural_Variants"], col = NA))
+          ), 
+          alter_fun_is_vectorized = FALSE, 
+          col = col,
+          column_title = paste("MONSTAR2", cancer, "denovo somatic mutation landscape, top 30 genes" ))
+```
+
+Next, for genes with alteration frequency >5%, alteration frequency was compared with that of TCGA colorectal adenocarcinoma data
+
+```{r monstar_tcga}
+
+MONSTARvsTCGA <- top%>%
+  mutate(MONSTAR2 = round(total/length(samples)*100), digits = 0)%>%
+  select(MONSTAR2)%>%
+  filter(MONSTAR2>5)%>%
+  arrange(-MONSTAR2)
+MONSTARvsTCGA$Gene <- rownames(MONSTARvsTCGA)
+
+tcga_crc <- data.frame(Gene = rownames(MONSTARvsTCGA),
+                               TCGA = c(53, 67, 37, 25, 15, 16, 11, 12, 12, 12, 10, 12, 1, 0.7, 6, 9))
+
+MONSTARvsTCGA <- merge(MONSTARvsTCGA, tcga_crc, by = "Gene", all.x = TRUE)%>%
+  arrange(-MONSTAR2)
+
+```
+
+```{r barplot1, include=FALSE}
+
+level <- MONSTARvsTCGA$Gene
+MONSTARvsTCGA$Gene <- factor(MONSTARvsTCGA$Gene, levels = level)
+```
+
+```{r barplot2}
+MONSTARvsTCGA%>%
+  pivot_longer(cols = -Gene)%>%
+  ggplot(aes(x = Gene, y = value, fill = name))+
+  geom_col(position = "dodge")+
+  geom_text(aes(label = value), position = position_dodge(width = 1), vjust = -0.5, size = 4)+
+  theme_light()+
+  scale_fill_manual(values = c("dodgerblue3", "darkolivegreen2") )+
+  labs(title = "MONSTAR versus TCGA Pan Cancer Atlas - Colorectal Adenocarcinoma", y = "Percentage", fill = "Study")+
+  theme(axis.text.x = element_text(size = 10, angle = 30))
+```
+
+
+## 3. *TP53* variant breakdown
+
+Since there was a very high frequency of *TP53*, did a deep dive into the alterations at  variant level. 2 visuals were created, 1 lollipop plot for *TP53*, and 1 pie chart to show proportion of hotspot variants
+
+```{r hotspots, include=FALSE}
+## Get hotspot and annotate
+snv_hotspot <- read.table("/fsx/home/reference/hg38/annotation/variation/somatic_annot/hg38_MSKCC_snv_hotspot_genome.bed")
+snv_hotspot1 <- snv_hotspot%>%
+  separate(V1, c("Chromosome", "Start_Position"), sep = ":")%>%
+  mutate(Chromosome = gsub("chr", "", Chromosome))%>%
+  separate(Start_Position, c("Start_Position", "End"), sep = "-")%>%
+  select(Chromosome, Start_Position)%>%
+  mutate(Hotspot = paste0(Chromosome, ":", Start_Position))%>%
+  select(Hotspot)%>%
+  unlist()
+
+indel_hotspot <- read.table("/fsx/home/reference/hg38/annotation/variation/somatic_annot/hg38_MSKCC_indel_hotspot_genome.bed")
+indel_hotspot1 <- indel_hotspot%>%
+  separate(V1, c("Chromosome", "Start_Position"), sep = ":")%>%
+  mutate(Chromosome = gsub("chr", "", Chromosome))%>%
+  separate(Start_Position, c("Start_Position", "End"), sep = "-")%>%
+  select(Chromosome, Start_Position)%>%
+  mutate(Hotspot = paste0(Chromosome, ":", Start_Position))%>%
+  select(Hotspot)%>%
+  unlist()
+
+all_hotspots <- c(snv_hotspot1, indel_hotspot1)
+
+
+```
+
+```{r lollipop2, include=FALSE}
+## create maf object and saved to a text file
+crc.genomic <- genomic_table%>%
+  filter(CANCERTYPE =="Colorectal cancer")%>%
+  mutate(HotspotLoc = paste0(Chromosome,":",Start_Position))%>%
+  mutate(HotspotFlag= if_else(HotspotLoc %in% all_hotspots, "Y", "N"))
+keep <- c("Likely Oncogenic", "Oncogenic", "Resistance")
+sv <- c("DEL", "DNP", "INS", "SNP", "TNP")
+crc_maf <- crc.genomic%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(SOMATIC_STATUS =="somatic")%>%
+  filter(Variant_Type %in% sv)%>%
+  select(Tumor_Sample_Barcode, Hugo_Symbol, Chromosome, Start_Position, End_Position, Reference_Allele, 
+         Tumor_Seq_Allele2, Variant_Classification, Variant_Type, ProteinChange, VAF)
+crc_CN <-  crc.genomic%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(SOMATIC_STATUS =="somatic")%>%
+  filter(Variant_Type =="CNV")%>%
+  select(Hugo_Symbol, Tumor_Sample_Barcode, VAF)
+colnames(crc_CN) <- c("Gene", "Sample", "CN")           
+
+##write.table(crc_maf, row.names=F,
+##            col.names=T, quote=F, sep="\t",
+##            file="/fsx/home/vlee/Projects/MONSTAR2/Analysis_dataset/crc_maf.txt")
+```
+
+## 
+
+```{r lollipop3, include=TRUE}
+
+
+crc_maf_obj <- read.maf(maf = "/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/crc_maf.txt" )
+lollipopPlot(
+  maf = crc_maf_obj,
+  gene = 'TP53',
+  AACol = 'ProteinChange',
+  showMutationRate = TRUE,
+  labelPos = c(175, 282),
+  labPosSize = 2, 
+  domainLabelSize = 2,
+  axisTextSize = c(2, 1.5)
+)
+
+```
+
+Create a pie chart to show distribution of hotspot mutations in the *TP53* gene
+
+First extract data for count of observations of each variant annotated with hotspot status, calculate percentage of all *TP53* alterations
+```{r tp53_piechart, include=TRUE}
+## crc.genomic is a genomic table with each short variant annotated with hotspot status
+## filter on TP53
+crc_tp53 <- crc.genomic%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(SOMATIC_STATUS =="somatic")%>%
+  filter(Variant_Type %in% sv)%>%
+  filter(Hugo_Symbol =="TP53")
+tp53hotspots <- crc_tp53%>%
+  select(ProteinChange, HotspotFlag)%>%
+  unique()
+
+### then get a summary table of count of observations per variant
+
+tp53.var.table <- as.data.frame(table(crc_tp53$ProteinChange))
+colnames(tp53.var.table)  <-c("ProteinChange", "Freq")
+
+## merge count data with hotspot status
+tp53.var.table <- merge(tp53.var.table, tp53hotspots, by = "ProteinChange", all.x = TRUE)
+
+## extract key numbers then calculate percentage
+total <- as.numeric(sum(tp53.var.table$Freq))
+hotspottp53 <- as.numeric(sum(tp53.var.table[tp53.var.table$HotspotFlag=="Y",]$Freq))
+nonhotspottp53 <- as.numeric(sum(tp53.var.table[tp53.var.table$HotspotFlag=="N",]$Freq))
+
+tp53.var.table <- tp53.var.table%>%
+  mutate(Percent = Freq/426*100)
+
+
+```
+Next, plot the pie chart
+```{r tp53_piechart2, include=TRUE}
+lab <- c("non-hotspot (11%)", "R175H (11.3%)", "R282W (6.1%)", "R273H (4%)", "other hotpots (67.6%)")
+pie <- c(47, 48, 26, 17, 288)
+pie3D(pie, mar = rep(1.75, 4),
+      col = c("grey", "coral1", "brown2", "deeppink3", "rosybrown1" ),
+      border = "white",
+      labels = lab,
+      explode = 0.1,
+      labelcex = 1)
+
+```
+
+## 4. A study of Early-onset (EO) versus Late-onset (LO) colorectal cancers
+Colorectal cancer (CRC) is a leading cause of cancer deaths in Japan and incidence is expected to increase by 22.7% by 2050 (T Nguyen et al., Cancer Epidemiol Biomarkers Prev 2023)
+
+Several reports of CRC being increasingly diagnosed in younger individuals highlight this as a health issue. Trend of CRC incidence rate in younger versus older age groups was assessed using cancer incidence rate data extracted from this website : https://ganjoho.jp/public/qa_links/report/statistics/index.html
+
+Different reports use different age cut offs to assess EO versus LO. In this analysis EO was defined as <50 years old and LO as >=50 years old.
+
+The following code gets data and generates the line graph for cancer incidence rate in male and female individuals, <50 or >=50 from 2001 through 2019
+```{r incidence_trend1, include=TRUE}
+##Read in data
+data <- read.csv("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/cancer_incidence_df.csv")
+##Define "early" age groups
+early <- c("20-24", "25-29", "30-34", "35-39", "40-44", "45-49")
+
+data_crc_onset <- data%>%
+  mutate(Onset = if_else(Age.group %in%early, "<50", ">=50"))%>%
+  filter(Age.group!="all")%>%
+  filter(Cancer =="Colorectal")%>%
+  select(-Age.group)%>%
+  mutate(Sex_year = paste0(Sex, "-", Year))
+
+groups <- unique(data_crc_onset$Sex_year)
+## Each "group" is sex_year eg. Male_2001 is incidence rate in males in 2001.
+
+## For each group, split into EO and LO and calculated mean incidence rate in these age groups
+group_means <- c()
+for (g in groups){
+  dfeo <- data_crc_onset%>%
+    filter(Sex_year ==g)%>%
+    filter(Onset=="<50")
+  dflo <-  data_crc_onset%>%
+    filter(Sex_year ==g)%>%
+    filter(Onset ==">=50")
+  
+  group_means <- rbind(group_means, cbind(g, mean(dfeo$Incidence.Rate), mean(dflo$Incidence.Rate)))
+}
+
+group_means <- as.data.frame(group_means)
+colnames(group_means) <- c("Group", "Early", "Late")
+group_means <- group_means%>%
+  separate(Group, into = c("Sex", "Year"), sep="-")%>%
+  mutate(Cancer = "Colorectal")
+group_means$Early <- as.numeric(group_means$Early)
+group_means$Late <- as.numeric(group_means$Late)
+group_means$Year <- as.numeric(group_means$Year)
+
+head(group_means)
+
+
+```
+**Trend line for Early Onset CRCs**
+```{r incidence_trend2, include=TRUE}
+ggplot(group_means, aes(x=Year, y = Early, color = Sex))+
+  geom_line(stat = "identity",linewidth = 3)+
+  theme_light()+
+  scale_color_manual(values = c("orange", "dodgerblue"))+
+  theme(axis.title = element_text(size = 15),
+        axis.text = element_text(size = 25))+
+  ylab("Incidence Rate")
+
+
+```
+
+**Trend line for Late Onset CRCs**
+```{r}
+
+ggplot(group_means, aes(x=Year, y = Late, color = Sex))+
+  geom_line(stat = "identity",linewidth = 3)+
+  theme_light()+
+  scale_color_manual(values = c("orange", "dodgerblue"))+
+  theme(axis.title = element_text(size = 15),
+        axis.text = element_text(size = 25))+
+  ylab("Incidence Rate")
+
+
+```
+
+## 4.1 Clinical data summary for CRCs in the MONSTAR2 cohort
+First a clinical data overview of the CRC cohort in MONSTAR2. Overall age distribution, stage at diagnosis, best response in 1L systemic treatment was assessed.
+
+```{r crc_clinical1, include= FALSE}
+## set the age groups as factors
+
+crc_all$AgeGroup <- factor(crc_all$AgeGroup, levels = c("<40", "40-45", "46-50",">=50", "NA"))
+
+```
+Get distribution of Diagnosis age
+```{r crc_clinical2, include=TRUE}
+table(crc_all$AgeGroup)
+
+```
+Plot these as a pie chart 
+```{r crc_clinical3, include=TRUE}
+pie_crc_denovo_all <- c(48, 34, 32, 462)
+lab <- paste0(round(pie_crc_denovo_all/sum(pie_crc_denovo_all) * 100, 2), "%")
+lab <- c("<40\n 48 (8.3%)", "40-45\n 34 (5.9%)", "46-40\n 32 (5.6%)", ">=50\n 462 (80.2%)")
+
+pie(pie_crc_denovo_all, mar = rep(1.75, 4),
+      col = c("lightblue1", "aliceblue", "powderblue", "azure1" ),
+      border = "grey",
+      labels = lab)
+      
+```
+
+
+Check the histological stage of these cancer diagnoses
+```{r crc_clinical4, include=TRUE}
+table(crc_all$Onset, crc_all$Diag_stg)
+```
+
+Next we assess if there are differences in treatment responses in patients. Best response for the 1st line systemic treatment was assessed.
+
+First get treatment history data
+```{r treatment1, include=TRUE}
+
+cm <- read.csv("/fsx/home/vlee/Projects/MONSTAR2/Analysis_dataset/allcm_data_2024-08-08.csv")
+```
+Filter down to crc patients, and 1st line of treatment then annotate as EO or LO. 
+Check frequency of observations for each response category
+```{r treatment2, include=FALSE}
+crc_all_list <- crc_all%>%
+  select(SUBJID)%>%
+  unlist()
+
+## Generate SUBJID list for EO and LO, Set cut off age here. 
+eo_crc_denovo_allsub_list <- crc_all%>%
+  filter(FirstDXAge<50)%>%
+  select(SUBJID)%>%
+  unlist()
+
+lo_crc_denovo_allsub_list <- crc_all%>%
+  filter(FirstDXAge>=50)%>%
+  select(SUBJID)%>%
+  unlist()
+
+## Get all crcs, without prior CM, 1L response info
+cm_crc <- cm%>%
+  filter(SUBJID %in% crc_all_list)%>%
+  filter(CMLINE =="1")%>%
+  select(SUBJID_VISIT, SUBJID, Regimen, BR)%>%
+  unique()%>%
+  mutate(Onset = if_else(SUBJID %in% eo_crc_denovo_allsub_list, "EO", 
+                         if_else(SUBJID %in% lo_crc_denovo_allsub_list, "LO", "")))%>%
+  filter(Onset!="")
+```
+
+```{r treatment3, include=TRUE}
+table(cm_crc$Onset, cm_crc$BR)
+```
+
+Plot the stacked bar graph
+
+```{r treatment4, include=TRUE}
+
+level <- c("CR", "PR", "SD", "non-CR_nonPD", "PD", "NE")
+cm_crc$BR <- factor(cm_crc$BR, levels = level)
+ggplot(cm_crc, aes(x = Onset, fill = BR))+
+  geom_bar(position = "fill")+
+  scale_fill_brewer(palette = 4)+
+  theme_light()+
+  theme(axis.title = element_text(size = 15),
+        axis.text = element_text(size = 20),
+        legend.text = element_text(size = 22))+
+  ylab("Proportion")
+
+```
+
+## 4.2 Assess TMB and MSI status in MONSTAR2 CRC cohort
+The following 2 analyses aim at looking at the breakdown of TMB high vs low and MSI vs MSS in MONSTAR2, in comparison with 3 other data sets - TCGA, MSK Cancer Cell 2018 and MSK JNCI 2021
+
+```{r tmb_msi1, include=FALSE}
+eo_all_list <- crc_all%>%
+  filter(FirstDXAge<50)%>%
+  select(Tumor_Sample_Barcode)%>%
+  unlist()
+
+lo_all_list <- crc_all%>%
+  filter(FirstDXAge>=50)%>%
+  select(Tumor_Sample_Barcode)%>%
+  unlist()
+
+all_crc_list <- c(eo_all_list, lo_all_list)
+
+```
+
+Prepare a dataframe containing TMB and MSI results for plotting stacked bar chart.
+Get TMB and MSI information from genomic table. Annotate as EO or LO, extract number from TMB result column and annotate as High or low based on a cut off of TMB >=10 as high.
+```{r tmb_msi2, include=TRUE}
+
+genomic_all_crc <- genomic_table%>%
+  filter(Tumor_Sample_Barcode %in% all_crc_list)%>%
+  mutate(Onset = if_else(Tumor_Sample_Barcode%in%eo_all_list, "EO", 
+                         if_else(Tumor_Sample_Barcode%in%lo_all_list, "LO", "check")))%>%
+  select(Tumor_Sample_Barcode, TMB, MSI_Status, Onset, LOH_Call)%>%
+  unique()%>%
+  mutate(TMBnum = as.numeric(str_extract(TMB, "[0-9]+")))%>%
+  mutate(TMB_status = if_else(TMBnum>=10, "High", "Low"))
+
+## get MSI data, exclude those resulted as "indeterminate" and summarize based on Onset
+MONSTAR_msi <- genomic_all_crc%>%
+  filter(MSI_Status!="indeterminate")
+monstar_plotdf <- as.data.frame(table(MONSTAR_msi$Onset, MONSTAR_msi$MSI_Status))
+head(monstar_plotdf)
+
+```
+Plot a stacked bar chart for MSI status for the MONSTAR2 CRC cohort
+```{r tmb_msi3, include=TRUE}
+ggplot(monstar_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.4)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MONSTAR2")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("plum4", "thistle2"), name = "MSI Status")
+```
+Create same stacked bar plot for TMB status
+```{r tmb_msi4, include=TRUE}
+monstartmb_plotdf <- as.data.frame(table(genomic_all_crc$Onset, genomic_all_crc$TMB_status))
+
+ggplot(monstartmb_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.4)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MONSTAR2")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("dodgerblue", "skyblue"), name = "TMB")
+  
+```
+
+Same stacked bar charts for the TCGA data
+```{r tmb_msi5, include=FALSE}
+pancan <- fread("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/coadread_tcga_pan_can_atlas_2018_clinical_data.tsv")
+pancan <- pancan%>%
+  mutate(MSI_status = if_else(`MSIsensor Score`<3, "MSS", "MSI-H"))%>%
+  mutate(Onset = if_else(`Diagnosis Age`<50, "EO", "LO"))%>%
+  mutate(TMB_status = if_else(`TMB (nonsynonymous)`>=10, "High", "Low"))
+
+```
+
+```{r, tmb_msi6, echo=FALSE , fig.show='hold', out.width="50%"}
+pancan_plotdf <- as.data.frame(table( pancan$Onset, pancan$MSI_status))
+ggplot(pancan_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("TCGA COADREAD")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("plum4", "thistle2"), name = "MSI Status")
+
+pancantmb_plotdf <- as.data.frame(table( pancan$Onset, pancan$TMB_status))
+ggplot(pancantmb_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("TCGA COADREAD")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("dodgerblue", "skyblue"), name = "TMB")
+```
+
+Same stacked bar charts for MSK Cancer Cell 2018
+
+```{r tmb_msi7, include=FALSE}
+msk <- fread("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/crc_msk_2017_clinical_data.tsv")
+msk <- msk%>%
+  mutate(Onset = if_else(`Age at Diagnosis`<50, "EO", "LO"))%>%
+  filter(`MSI Status`!="Inconclusive")%>%
+  mutate(TMB_status = if_else(`TMB (nonsynonymous)`>=10, "High", "Low"))
+
+```
+
+```{r tmb_msi8, echo=FALSE , fig.show='hold', out.width="50%" }
+
+msk_plotdf <- as.data.frame(table( msk$Onset, msk$`MSI Status`))
+ggplot(msk_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MSK, Cancer Cell 2018")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("plum4", "thistle2"), name = "MSI Status")
+
+msktmb_plotdf <- as.data.frame(table( msk$Onset, msk$TMB_status))
+ggplot(msktmb_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MSK, Cancer Cell 2018")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("dodgerblue", "skyblue"), name = "MSI Status")
+
+```
+
+Same stacked bar charts for MSK JNCI 2021
+
+```{r tmb_msi9, include=FALSE}
+mskjnci <- fread("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/crc_eo_2020_clinical_data.tsv")
+mskjnci <- mskjnci%>%
+  mutate(Onset = if_else(`Age at Diagnosis`<50, "EO", "LO"))%>%
+  filter(!`MSI Type`%in% c("Do not report", "Indeterminate"))%>%
+  mutate(TMB_Status = if_else(`Impact TMB Score`>=10, "High", "Low"))
+```
+
+```{r tmb_msi10, echo=FALSE , fig.show='hold', out.width="50%"}
+mskjnci_plotdf <- as.data.frame(table( mskjnci$Onset, mskjnci$`MSI Type`))
+ggplot(mskjnci_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MSK, JNCI 2021")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("plum4", "thistle2"), name = "MSI Status")
+
+mskjncitmb_plotdf <- as.data.frame(table( mskjnci$Onset, mskjnci$TMB_Status))
+ggplot(mskjncitmb_plotdf, aes(fill=Var2, y=Freq, x=Var1)) + 
+  geom_bar(position="fill", stat="identity", width = 0.5)+
+  theme_light()+
+  theme(axis.text = element_text(size = 25),
+        plot.title = element_text(size = 30),
+        legend.text = element_text(size = 20))+
+  ggtitle("MSK, JNCI 2021")+
+  xlab("Onset")+
+  ylab("Proportion")+
+  scale_fill_manual(values=c("dodgerblue", "skyblue"), name = "MSI Status")
+
+```
+
+## 4.3 EO vs LO MSS CRC cancer mutation landscape
+Microsatellite instable CRCs are eligible for immunotherapy treatment. Availabilty of CDx assays for this fraction of patients might have biased the prevalence of TMB high and MSI instable CRCs in the MONSTAR2 cohort. Nevertheless, MSS CRCs is the population with a higher unmet need, so the following analyses focuses on understanding molecular differences in EO vs LO in this population.
+The analyses also focuses on *de novo* samples to understand *de novo* molecular differences
+
+First, somatic alteration frequency in *de novo* MSS CRCs were summarized
+
+This code chunk gets alteration counts for each EO and LO CRC, then calculates the alterations percentages and creates a dataframe to use in creating a bar chart.
+```{r, msscrc1, include=TRUE}
+
+##Get sample lists
+eo_crc_denovo_all_list <- crc_all%>%
+  filter(FirstDXAge<50)%>%
+  filter(PrimaryCancerHist =="Tubular adenocarcinoma (tub)")%>%
+  filter(TxNaiveSamp =="Y")%>%
+  select(Tumor_Sample_Barcode)%>%
+  unlist()
+
+lo_crc_denovo_all_list <- crc_all%>%
+  filter(FirstDXAge>=50)%>%
+  filter(PrimaryCancerHist =="Tubular adenocarcinoma (tub)")%>%
+  filter(TxNaiveSamp =="Y")%>%
+  select(Tumor_Sample_Barcode)%>%
+  unlist()
+
+## filter down genomic table to MSS 
+genomic_matrix_mss_somatic <- genomic_table%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(SOMATIC_STATUS =="somatic")%>%
+  filter(MSI_Status =="Stable")%>%
+  mutate(Missense = if_else(Variant_Classification =="Missense_Mutation", 1, 0))%>%
+  mutate(Stop = if_else(Variant_Classification =="Nonsense_Mutation", 1, 0))%>%
+  mutate(Splice =if_else(Variant_Classification =="Splice_Site",1, 0))%>%
+  mutate(Frameshift = if_else(grepl("Frame_Shift", Variant_Classification), 1,0))%>%
+  mutate(Inframe = if_else(grepl("In_Frame", Variant_Classification), 1, 0))%>%
+  mutate(Amplification = if_else(VAF =="Amplification", 1, 0))%>%
+  mutate(Deletion = if_else(VAF =="Deletion", 1,0))%>%
+  mutate(Structural_var = if_else(Variant_Type =="Fusion", 1, 0))%>%
+  select(Tumor_Sample_Barcode, CANCERTYPE, Hugo_Symbol, Missense, Stop, Splice, Frameshift, Inframe, Amplification, Deletion, Structural_var)
+
+### Create count matrix for EO_CRC
+eo_genelist <- genomic_matrix_mss_somatic%>%
+  filter(Tumor_Sample_Barcode %in% eo_crc_denovo_all_list)%>%
+  select(Hugo_Symbol)%>%
+  unique()%>%
+  unlist()
+eo_samples <-  genomic_matrix_mss_somatic%>%
+  filter(Tumor_Sample_Barcode %in% eo_crc_denovo_all_list)%>%
+  select(Tumor_Sample_Barcode)%>%
+  unique()%>%
+  unlist()
+
+### Missense Matrix
+missense_matrix <- matrix(0,
+                          nrow = length(eo_genelist),
+                          ncol = length(eo_samples))
+colnames(missense_matrix) = eo_samples
+rownames(missense_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  missense_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Missense)
+}
+### Nonsense matrix
+nonsense_matrix <- matrix(0,
+                          nrow = length(eo_genelist),
+                          ncol = length(eo_samples))
+colnames(nonsense_matrix) = eo_samples
+rownames(nonsense_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  nonsense_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Stop)
+}
+## Splice variants matrix
+splice_matrix <- matrix(0,
+                        nrow = length(eo_genelist),
+                        ncol = length(eo_samples))
+colnames(splice_matrix) = eo_samples
+rownames(splice_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  splice_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Splice)
+}
+## Frameshift variants matrix
+fs_matrix <- matrix(0,
+                    nrow = length(eo_genelist),
+                    ncol = length(eo_samples))
+colnames(fs_matrix) = eo_samples
+rownames(fs_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  fs_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Frameshift)
+}
+
+## Inframe variants matrix
+inframe_matrix <- matrix(0,
+                         nrow = length(eo_genelist),
+                         ncol = length(eo_samples))
+colnames(inframe_matrix) = eo_samples
+rownames(inframe_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  inframe_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Inframe)
+}
+
+## Amplifications variants matrix
+amp_matrix <- matrix(0,
+                     nrow = length(eo_genelist),
+                     ncol = length(eo_samples))
+colnames(amp_matrix) = eo_samples
+rownames(amp_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  amp_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Amplification)
+}
+
+## Deletions variants matrix
+del_matrix <- matrix(0,
+                     nrow = length(eo_genelist),
+                     ncol = length(eo_samples))
+colnames(del_matrix) = eo_samples
+rownames(del_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  del_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Deletion)
+}
+## Fusion variants matrix
+fusion_matrix <- matrix(0,
+                        nrow = length(eo_genelist),
+                        ncol = length(eo_samples))
+colnames(fusion_matrix) = eo_samples
+rownames(fusion_matrix) = eo_genelist
+
+for (s in eo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  fusion_matrix[match(tmp$Hugo_Symbol, eo_genelist), s] = as.numeric(tmp$Structural_var)
+}
+
+
+top <- data.frame(missense = rowSums(missense_matrix),
+                  nonsense = rowSums(nonsense_matrix),
+                  splice = rowSums(splice_matrix),
+                  inframe = rowSums(inframe_matrix),
+                  fs = rowSums(fs_matrix),
+                  amp = rowSums(amp_matrix),
+                  del = rowSums(del_matrix),
+                  fus = rowSums(fusion_matrix))
+rownames(top) <- rownames(missense_matrix)
+top$total <- rowSums(top)
+top20 <- top%>%
+  arrange(desc(total))%>%
+  slice(1:30)
+top20 <- rownames(top20)
+eo_top <- top
+##this is the count matrix for EO_CRC
+head(eo_top)
+
+
+##### Create count matrix for LO_CRC
+lo_genelist <- genomic_matrix_mss_somatic%>%
+  filter(Tumor_Sample_Barcode %in% lo_crc_denovo_all_list)%>%
+  select(Hugo_Symbol)%>%
+  unique()%>%
+  unlist()
+lo_samples <-  genomic_matrix_mss_somatic%>%
+  filter(Tumor_Sample_Barcode %in% lo_crc_denovo_all_list)%>%
+  select(Tumor_Sample_Barcode)%>%
+  unique()%>%
+  unlist()
+
+### Missense Matrix
+missense_matrix <- matrix(0,
+                          nrow = length(lo_genelist),
+                          ncol = length(lo_samples))
+colnames(missense_matrix) = lo_samples
+rownames(missense_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  missense_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Missense)
+}
+### Nonsense matrix
+nonsense_matrix <- matrix(0,
+                          nrow = length(lo_genelist),
+                          ncol = length(lo_samples))
+colnames(nonsense_matrix) = lo_samples
+rownames(nonsense_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  nonsense_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Stop)
+}
+## Splice variants matrix
+splice_matrix <- matrix(0,
+                        nrow = length(lo_genelist),
+                        ncol = length(lo_samples))
+colnames(splice_matrix) = lo_samples
+rownames(splice_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  splice_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Splice)
+}
+## Frameshift variants matrix
+fs_matrix <- matrix(0,
+                    nrow = length(lo_genelist),
+                    ncol = length(lo_samples))
+colnames(fs_matrix) = lo_samples
+rownames(fs_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  fs_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Frameshift)
+}
+
+## Inframe variants matrix
+inframe_matrix <- matrix(0,
+                         nrow = length(lo_genelist),
+                         ncol = length(lo_samples))
+colnames(inframe_matrix) = lo_samples
+rownames(inframe_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  inframe_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Inframe)
+}
+
+
+## Amplifications variants matrix
+amp_matrix <- matrix(0,
+                     nrow = length(lo_genelist),
+                     ncol = length(lo_samples))
+colnames(amp_matrix) = lo_samples
+rownames(amp_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  amp_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Amplification)
+}
+
+## Deletions variants matrix
+del_matrix <- matrix(0,
+                     nrow = length(lo_genelist),
+                     ncol = length(lo_samples))
+colnames(del_matrix) = lo_samples
+rownames(del_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  del_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Deletion)
+}
+## Fusion variants matrix
+fusion_matrix <- matrix(0,
+                        nrow = length(lo_genelist),
+                        ncol = length(lo_samples))
+colnames(fusion_matrix) = lo_samples
+rownames(fusion_matrix) = lo_genelist
+
+for (s in lo_samples){
+  tmp = genomic_matrix_mss_somatic[genomic_matrix_mss_somatic$Tumor_Sample_Barcode ==s,]
+  fusion_matrix[match(tmp$Hugo_Symbol, lo_genelist), s] = as.numeric(tmp$Structural_var)
+}
+
+top <- data.frame(missense = rowSums(missense_matrix),
+                  nonsense = rowSums(nonsense_matrix),
+                  splice = rowSums(splice_matrix),
+                  inframe = rowSums(inframe_matrix),
+                  fs = rowSums(fs_matrix),
+                  amp = rowSums(amp_matrix),
+                  del = rowSums(del_matrix),
+                  fus = rowSums(fusion_matrix))
+rownames(top) <- rownames(missense_matrix)
+top$total <- rowSums(top)
+top20 <- top%>%
+  arrange(desc(total))%>%
+  slice(1:30)
+top20 <- rownames(top20)
+lo_top <- top
+##this is the count matrix for LO CRC
+head(lo_top)
+
+## create data for bar chart
+## First, for EO data, calculate the percentages for the following type of variants
+eo_vs_lo <- eo_top%>%
+  mutate(Short_Var = round((missense+nonsense+splice+inframe+fs)/63*100), digits = 0)%>%
+  mutate(Amp = round(amp/63*100), digits = 0)%>%
+  mutate(Del = round(del/63*100),digits = 0)%>%
+  mutate(Fusions = round(fus/63*100),digits = 0)%>%
+  mutate(Onset = "EO")%>%
+  mutate(Hugo_Symbol = rownames(eo_top))%>%
+  select(Hugo_Symbol, Onset, Short_Var, Amp, Del, Fusions)%>%
+  pivot_longer(cols = c("Short_Var", "Amp", "Del", "Fusions"),
+               names_to = "Alteration",
+               values_to = "Percentage")
+
+## Same is done for the LO data
+lo <- lo_top%>%
+  mutate(Short_Var = round((missense+nonsense+splice+inframe+fs)/255*100), digits = 0)%>%
+  mutate(Amp = round(amp/255*100), digits = 0)%>%
+  mutate(Del = round(del/255*100), digits = 0)%>%
+  mutate(Fusions = round(fus/255*100),digits = 0)%>%
+  mutate(Onset = "LO")%>%
+  mutate(Hugo_Symbol = rownames(lo_top))%>%
+  select(Hugo_Symbol, Onset, Short_Var, Amp,, Del, Fusions)%>%
+  pivot_longer(cols = c("Short_Var", "Amp", "Del", "Fusions"),
+               names_to = "Alteration",
+               values_to = "Percentage")
+
+## merge the EO and LO data
+eo_vs_lo <- rbind(lo, eo_vs_lo)
+
+head(eo_vs_lo)
+
+```
+
+**Plot the bar chart**
+
+```{r, eolo_overall, echo=FALSE}
+
+## Define the genes and variants to plot
+plotgenes <- c("TP53", "APC", "KRAS", "SMAD4", "FBXW7", "SOX9", "AMER1", "ATM",
+               "PIK3CA", "FGF3", "TCF7L2", "ERBB2", "RNF43", "BRAF", "ARID1A", "PTEN",
+               "CCND1", "FGF19", "SMAD3", "FGF4")
+variants <- c("Short_Var", "Amp", "Del", "Fusions")
+
+eo_vs_lo_sm <- eo_vs_lo%>%
+  filter(Hugo_Symbol%in% plotgenes)
+eo_vs_lo_sm$Hugo_Symbol <- factor(eo_vs_lo_sm$Hugo_Symbol, levels = plotgenes)
+eo_vs_lo_sm$Alteration <- factor(eo_vs_lo_sm$Alteration, levels = variants)
+
+
+ggplot(eo_vs_lo_sm)+
+  geom_bar(aes(x = Onset, y = Percentage, fill = Alteration),
+           position = "stack", stat = "identity")+
+  scale_fill_manual(values = c("lightskyblue2", "firebrick", "blue", "mediumpurple1"))+
+  facet_grid(~Hugo_Symbol, switch = "x")+
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(-.01,"cm"))+
+  theme(panel.background = element_rect(fill = "white", colour = "lightgrey"),
+        axis.text = element_text(size = 7, angle = 45),
+        strip.text.x = element_text(size = 14, angle = 45),
+        legend.text = element_text(size = 20))
+```
+
+Next we zoom in on the frequency of alterations in the *WNT* signalling pathway. Hallmark pathway HALLMARK_WNT_BETA_CATENIN_SIGNALING gene set was used. 2 figures were created 1)Overall alteration frequency at the pathway level and 2)Counts of alterations in each gene. 
+*TP53* was excluded from these figures since it was in the previous bar chart.
+
+```{r, wnt1, include=FALSE}
+## get wnt signalling gene set from Hallmark pathways
+hallmark <- gmtPathways("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/h.all.v2024.1.Hs.symbols.gmt")
+wntgenes <- hallmark$HALLMARK_WNT_BETA_CATENIN_SIGNALING
+```
+
+
+```{r, wnt2, include=TRUE}
+
+### Create a summary dataframe for the frequency (counts) of alterations, by EO and LO
+eo_vs_lo_counts <- eo_top%>%
+  mutate(Short_Var_count = missense+nonsense+splice+inframe+fs)%>%
+  mutate(Amp_count = amp)%>%
+  mutate(Del_count = del)%>%
+  mutate(Fusions_count = fus)%>%
+  mutate(Onset = "EO")%>%
+  mutate(Hugo_Symbol = rownames(eo_top))%>%
+  select(Hugo_Symbol, Onset, Short_Var_count, Amp_count, Del_count, Fusions_count)%>%
+  pivot_longer(cols = c("Short_Var_count", "Amp_count", "Del_count", "Fusions_count"),
+               names_to = "Alteration",
+               values_to = "Count")
+
+lo_counts <- lo_top%>%
+  mutate(Short_Var_count = missense+nonsense+splice+inframe+fs)%>%
+  mutate(Amp_count = amp)%>%
+  mutate(Del_count = del)%>%
+  mutate(Fusions_count = fus)%>%
+  mutate(Onset = "LO")%>%
+  mutate(Hugo_Symbol = rownames(lo_top))%>%
+  select(Hugo_Symbol, Onset, Short_Var_count, Amp_count, Del_count, Fusions_count)%>%
+  pivot_longer(cols = c("Short_Var_count", "Amp_count", "Del_count", "Fusions_count"),
+               names_to = "Alteration",
+               values_to = "Count")
+
+eo_vs_lo_counts <- rbind(eo_vs_lo_counts, lo_counts)
+
+## filter down to wnt pathway genes
+eo_vs_lo_wnt <- eo_vs_lo_counts%>%
+  filter(Hugo_Symbol%in% wntgenes)%>%
+  filter(Hugo_Symbol!="TP53")
+
+head(eo_vs_lo_wnt)
+
+```
+
+Using this df, percentage of alterations at pathway level were calculated
+
+```{r, wnt3, include=TRUE}
+## aggregate to pathway level, percent calculated using total n=63 for EO, n=255 for LO
+eolownt_pathway_level_perc2 <- eo_vs_lo_wnt%>%
+  group_by(Onset, Alteration)%>%
+  summarise(Total = sum(Count))%>%
+  mutate(Percent = if_else(Onset =="EO", as.numeric(Total/63*100), as.numeric(Total/255*100)))%>%
+  mutate(Alteration = gsub("count", "percent", Alteration))
+
+head(eolownt_pathway_level_perc2)
+```
+
+```{r wnt4, include=FALSE}
+## set parameters for plotting graph
+wnt_order <- c("CTNNB1", "MYC", "AXIN2", "CCND2", "AXIN1", "NOTCH1")
+alt_order <- c("Short_Var_count", "Amp_count", "Del_count", "Fusions_count")
+eo_vs_lo_wnt$Hugo_Symbol <- factor(eo_vs_lo_wnt$Hugo_Symbol, levels = wnt_order)
+eo_vs_lo_wnt$Alteration <- factor(eo_vs_lo_wnt$Alteration, levels = alt_order)
+
+
+eolownt_pathway_level_perc2$Alteration <- factor(eolownt_pathway_level_perc2$Alteration, levels = c("Short_Var_percent", "Amp_percent", "Del_percent", "Fusions_percent"))  
+
+```
+
+**Plot the bar charts for 1)Overall alteration frequency at the pathway level. **
+```{r wnt5, echo=FALSE}
+
+
+ggplot(eolownt_pathway_level_perc2, aes(x = Onset, y = Percent, fill = Alteration))+
+  geom_bar(position = "stack", stat = "identity")+
+  scale_fill_manual(values = c("lightskyblue2", "firebrick", "green4", "mediumpurple1"))+
+  theme_light()+
+  theme(axis.text = element_text(size = 20),
+        axis.title = element_text(size = 15),
+        legend.text = element_text(size = 15))+
+  ylab("Percentage")
+```
+
+**and 2)Counts of alterations in each gene**
+```{r, wnt6, echo=FALSE}
+ggplot(eo_vs_lo_wnt)+
+  geom_bar(aes(x = Onset, y = Count, fill = Alteration),
+           position = "stack", stat = "identity")+
+  scale_fill_manual(values = c("lightskyblue2", "firebrick","blue", "mediumpurple1"))+
+  facet_grid(~Hugo_Symbol, switch = "x")+
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(-.001,"cm"))+
+  theme(panel.background = element_rect(fill = "white", colour = "lightgrey"),
+        axis.text = element_text(size = 20, angle = 45),
+        strip.text.x = element_text(size = 20,angle = 45), 
+        legend.text = element_text(size = 18))
+```
+
+## 4.4 Assessing VAF of hotspot mutations in top altered genes
+
+Variant allele frequencies (VAF) of alterations in *TP53*, *APC*, *KRAS*, *PIK3CA* and *BRAF* were assessed.
+
+```{r, variant_level1, include=FALSE}
+mss_crc <- c(eo_samples, lo_samples)
+
+## create a df containing all EO and LO MSS CRC genomic alterations, flagged with 
+genomic_msscrc <- genomic_table%>%
+  filter(Tumor_Sample_Barcode %in% mss_crc)%>%
+  mutate(hotspot_index = paste0(Chromosome, ":",Start_Position))%>%
+  mutate(hotspot = if_else(hotspot_index %in% all_hotspots, "Y", "N"))%>%
+  mutate(Onset = if_else(Tumor_Sample_Barcode %in% eo_samples, "EO", "LO" ))
+
+```
+
+For each gene, a dot plot of VAFs were plotted for recurring (observed on >2 counts) hotspot alterations. 
+**e.g. For *TP53*:**
+```{r, variant_level2, include=TRUE}
+
+## filter down to TP53 hotspot alterations
+tp53 <- genomic_msscrc%>%
+  filter(Hugo_Symbol =="TP53")%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(hotspot =="Y")%>%
+  select(Tumor_Sample_Barcode, ProteinChange, VAF, hotspot, ONCOGENIC, Onset)
+
+## Get frequency of hotspot alterations
+tp53_freq <- as.data.frame(table(tp53$ProteinChange))
+
+## Get the list of recurring hotspot alterations
+tp53_recurr <- tp53_freq%>%
+  filter(Freq > 2)%>%
+  select(Var1)%>%
+  unlist()%>%
+  as.character()
+
+##create a df for VAF of recurring hotspots
+
+tp53_VAF <- tp53%>%
+  filter(ProteinChange %in% tp53_recurr)
+tp53_VAF$VAF <- as.numeric(tp53_VAF$VAF)
+tp53_VAF$Onset <- as.factor(tp53_VAF$Onset)
+
+##plot the dotplot
+
+ggplot(tp53_VAF, aes(x = fct_reorder(ProteinChange, VAF, .fun= median, .desc = TRUE) , y = VAF,  fill = Onset))+
+   geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 2.5, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("Recurring hotspot TP53 mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("lightblue1", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 15, angle = 30),
+        title = element_text(size = 17))+
+  xlab("Variant")
+        
+
+```
+
+**For *APC* **
+
+```{r, variant_level3, echo=FALSE}
+
+
+apc <- genomic_msscrc%>%
+  filter(Hugo_Symbol =="APC")%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(hotspot =="Y")%>%
+  select(Tumor_Sample_Barcode, ProteinChange, VAF, hotspot, ONCOGENIC, Onset)
+apc_freq <- as.data.frame(table(apc$ProteinChange))
+apc_recurr <- apc_freq%>%
+  filter(Freq > 2)%>%
+  select(Var1)%>%
+  unlist()%>%
+  as.character()
+
+apc_VAF <- apc%>%
+  filter(ProteinChange %in% apc_recurr)
+apc_VAF$VAF <- as.numeric(apc_VAF$VAF)
+apc_VAF$Onset <- as.factor(apc_VAF$Onset)
+
+ggplot(apc_VAF, aes(x = fct_reorder(ProteinChange, VAF, .fun= median, .desc = TRUE) , y = VAF,  fill = Onset))+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 2.5, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("Recurring hotspot APC mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("lightblue1", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 15, angle = 30),
+        title = element_text(size = 17))+
+  xlab("Variant")
+
+```
+
+**For *KRAS*:**
+
+```{r, variant_level4, echo=FALSE}
+kras <- genomic_msscrc%>%
+  filter(Hugo_Symbol =="KRAS")%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(hotspot =="Y")%>%
+  select(Tumor_Sample_Barcode, ProteinChange, VAF, hotspot, ONCOGENIC, Onset)
+kras_freq <- as.data.frame(table(kras$ProteinChange))
+kras_recurr <- kras_freq%>%
+  filter(Freq > 2)%>%
+  select(Var1)%>%
+  unlist()%>%
+  as.character()
+
+kras_VAF <- kras%>%
+  filter(ProteinChange %in% kras_recurr)
+kras_VAF$VAF <- as.numeric(kras_VAF$VAF)
+kras_VAF$Onset <- as.factor(kras_VAF$Onset)
+
+ggplot(kras_VAF, aes(x = fct_reorder(ProteinChange, VAF, .fun= median, .desc = TRUE) , y = VAF,  fill = Onset))+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 2.5, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("Recurring hotspot KRAS mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("lightblue1", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 15, angle = 30),
+        title = element_text(size = 17))+
+  xlab("Variant")
+```
+
+**For *PIK3CA*:**
+
+```{r, variant_level5, echo=FALSE}
+
+pik <- genomic_msscrc%>%
+  filter(Hugo_Symbol =="PIK3CA")%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(hotspot =="Y")%>%
+  select(Tumor_Sample_Barcode, ProteinChange, VAF, hotspot, ONCOGENIC, Onset)
+pik_freq <- as.data.frame(table(pik$ProteinChange))
+pik_recurr <- pik_freq%>%
+  filter(Freq > 2)%>%
+  select(Var1)%>%
+  unlist()%>%
+  as.character()
+
+pik_VAF <- pik%>%
+  filter(ProteinChange %in% pik_recurr)
+pik_VAF$VAF <- as.numeric(pik_VAF$VAF)
+pik_VAF$Onset <- as.factor(pik_VAF$Onset)
+
+ggplot(pik_VAF, aes(x = fct_reorder(ProteinChange, VAF, .fun= median, .desc = TRUE) , y = VAF,  fill = Onset))+
+ # geom_boxplot(outlier.color = NULL, outlier.fill = NULL, outlier.shape = NULL)+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 6, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("Recurring hotspot PIK3CA mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("red", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 20, angle = 30),
+        title = element_text(size = 20))+
+  xlab("Variant")
+
+
+```
+
+**For *BRAF*:**
+
+```{r, variant_level6, echo=FALSE}
+
+braf <-genomic_msscrc%>%
+  filter(Hugo_Symbol =="BRAF")%>%
+  filter(ONCOGENIC %in% keep)%>%
+  filter(hotspot =="Y")%>%
+  select(Tumor_Sample_Barcode, ProteinChange, VAF, hotspot, ONCOGENIC, Onset)
+braf_freq <- as.data.frame(table(braf$ProteinChange))
+braf_recurr <- braf_freq%>%
+  filter(Freq > 2)%>%
+  select(Var1)%>%
+  unlist()%>%
+  as.character()
+
+braf_VAF <- braf%>%
+  filter(ProteinChange %in% braf_recurr)
+braf_VAF$VAF <- as.numeric(braf_VAF$VAF)
+braf_VAF$Onset <- as.factor(braf_VAF$Onset)
+
+ggplot(braf_VAF, aes(x = fct_reorder(ProteinChange, VAF, .fun= median, .desc = TRUE) , y = VAF,  fill = Onset))+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 6, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("Recurring hotspot BRAF mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("red", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 20, angle = 30),
+        title = element_text(size = 20))+
+  xlab("Variant")
+
+```
+
+
+A possible enrichment of *PIK3CA* and *BRAF* hotspot mutations were seen in the LO group. Therefore TCGA data was assessed to see if the same trends were observed
+
+```{r, tcga1, include=TRUE}
+##define cancer types and stages to include
+cancer <- c("Colon Adenocarcinoma", "Rectal Adenocarcinoma")
+stages <- c("STAGE III", "STAGE IIIA", "STAGE IIIB", "STAGE IIIC", "STAGE IV", "STAGE IVA", "STAGE IVB")
+
+## Get TCGA late stage MSS CRC clinical data and annotate with EO or LO and MSI status
+tcga_crc <- read.delim("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/coadread_tcga_pan_can_atlas_2018_clinical_data.tsv")
+tcga_crc_late_stag <- tcga_crc%>%
+  mutate(MSIStatus = if_else(MSIsensor.Score<3, "MSS", "MSI"))%>%
+  mutate(Onset = if_else(Diagnosis.Age<50 , "EO", "LO"))%>%
+  filter(Cancer.Type.Detailed %in% cancer)%>%
+  filter(Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code %in% stages)%>%
+  filter(MSIStatus =="MSS")
+
+## read in list of PIK3CA mutants downloaded from cbioportal, then filter down to MSS cancers, hotspot mutations
+tcga_pik <- read.delim("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/tcga_COADREAD_pik3camuts.tsv")
+tcga_pik_late_stg <- tcga_pik%>%
+  mutate(MSIStatus = if_else(MSIsensor.Score<3, "MSS", "MSI"))%>%
+  mutate(Onset = if_else(Diagnosis.Age<50 , "EO", "LO"))%>%
+  filter(Cancer.Type.Detailed %in% cancer)%>%
+  filter(Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code %in% stages)%>%
+  filter(grepl("CancerHotspot: yes", Annotation))%>%
+  filter(MSIStatus =="MSS")%>%
+  filter(Protein.Change %in% c("E542K", "E545K", "H1047R"))
+
+```
+
+**Plot the dotplot for TCGA Late stage MSS CRC *PIK3CA* alterations for H1047R, E542K and E545K**
+
+```{r, tcga2, echo=FALSE}
+
+ggplot(tcga_pik_late_stg, aes(x = fct_reorder(Protein.Change, Allele.Freq..T., .fun= median, .desc = TRUE) , y = Allele.Freq..T.,  fill = Onset))+
+  # geom_boxplot(outlier.color = NULL, outlier.fill = NULL, outlier.shape = NULL)+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 4, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("TCGA recurring hotspot PIK3CA mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("red", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 10, angle = 30),
+        title = element_text(size = 10),
+        axis.text.x = element_text(size = 10))+
+  xlab("Variant")
+
+```
+
+**TCGA data for *BRAF* V600E was also assessed. **
+
+```{r, tcga3, echo=FALSE}
+
+tcga_braf <- read.delim("/fsx/home/vlee/Projects/MONSTAR2/EO_vs_LO_CRC/tcga_COADREAD_brafmuts.tsv")
+tcga_braf_late_stg <- tcga_braf%>%
+  mutate(MSIStatus = if_else(MSIsensor.Score<3, "MSS", "MSI"))%>%
+  mutate(Onset = if_else(Diagnosis.Age<50 , "EO", "LO"))%>%
+  filter(Cancer.Type.Detailed %in% cancer)%>%
+  filter(Neoplasm.Disease.Stage.American.Joint.Committee.on.Cancer.Code %in% stages)%>%
+  filter(grepl("CancerHotspot: yes", Annotation))%>%
+  filter(MSIStatus =="MSS")
+  
+ggplot(tcga_braf_late_stg, aes(x = fct_reorder(Protein.Change, Allele.Freq..T., .fun= median, .desc = TRUE) , y = Allele.Freq..T.,  fill = Onset))+
+  # geom_boxplot(outlier.color = NULL, outlier.fill = NULL, outlier.shape = NULL)+
+  geom_point(aes(colour = Onset, shape = Onset), alpha = 0.8, size = 4, position = position_jitterdodge(jitter.width = 0.1) )+
+  theme_light()+
+  ggtitle("TCGA recurring hotspot BRAF mutations - VAF")+
+  scale_fill_manual(values = c("lightblue1", "dodgerblue3"))+
+  scale_color_manual(values = c("red", "dodgerblue3"))+
+  theme(axis.text = element_text(size = 10, angle = 30),
+        title = element_text(size = 10))+
+  xlab("Variant")
+
+```
+(No hotspot mutations in BRAF were observed in the TCGA dataset)
+
+
+## END
+
+
